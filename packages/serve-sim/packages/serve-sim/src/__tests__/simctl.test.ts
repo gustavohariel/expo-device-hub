@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { simctl, simctlRaw } from "../simctl";
-import { PasteboardTooLargeError, readSimPasteboardResult } from "../sim-pasteboard";
+import { PasteboardTooLargeError } from "../sim-pasteboard";
+import { readSimPasteboardResult } from "../sim-pasteboard-reader";
 import { withShimsAsync } from "./helpers";
 
 describe("simctl", () => {
@@ -25,6 +26,12 @@ describe("simctl", () => {
 
   test("reports an oversized simulator clipboard separately from a command failure", async () => {
     await withShimsAsync({ xcrun: "#!/bin/sh\nhead -c 4194305 /dev/zero\n" }, async () => {
+      await expect(readSimPasteboardResult("DEVICE")).rejects.toBeInstanceOf(PasteboardTooLargeError);
+    });
+  });
+
+  test("keeps the oversized-read classification when simctl also writes stderr", async () => {
+    await withShimsAsync({ xcrun: "#!/bin/sh\necho warning >&2\nhead -c 4194305 /dev/zero\n" }, async () => {
       await expect(readSimPasteboardResult("DEVICE")).rejects.toBeInstanceOf(PasteboardTooLargeError);
     });
   });

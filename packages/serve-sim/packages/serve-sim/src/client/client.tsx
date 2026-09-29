@@ -133,6 +133,16 @@ import {
 
 // Default CSS-pixel width of the fixed 1:1 Duo stage, independent of either screen.
 const DUO_STAGE_DEFAULT_WIDTH = 580;
+// A barrier waits behind every earlier input on the socket, which can include a long paste.
+const INPUT_BARRIER_TIMEOUT_MS = 150_000;
+
+type PendingInputBarrier = {
+  connection: object;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
+
 type PreviewConfig = NonNullable<Window["__SIM_PREVIEW__"]>;
 
 function isLogsShortcut(e: KeyboardEvent): boolean {
@@ -933,12 +943,18 @@ function AppWithConfig({
     resolve: (result: { cleanupWarning?: string }) => void;
     reject: (error: Error) => void;
   } | null>(null);
-  const cancelPendingPaste = useCallback(() => {
+  const pendingInputBarriersRef = useRef<PendingInputBarrier[]>([]);
+  const cancelPendingClipboardInput = useCallback(() => {
     const pending = pendingPasteRef.current;
-    if (!pending) return;
-    clearTimeout(pending.timeout);
-    pendingPasteRef.current = null;
-    pending.reject(new Error("Simulator input disconnected during paste"));
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pendingPasteRef.current = null;
+      pending.reject(new Error("Simulator input disconnected during paste"));
+    }
+    for (const barrier of pendingInputBarriersRef.current.splice(0)) {
+      clearTimeout(barrier.timeout);
+      barrier.reject(new Error("Simulator input disconnected during copy"));
+    }
   }, []);
   if (!hingeQueueRef.current) {
     hingeQueueRef.current = createAcknowledgedControlQueue<HingeControlCommand>({
@@ -1004,6 +1020,16 @@ function AppWithConfig({
           } catch {}
           return false;
         }
+        if (bytes[0] === 0x91) {
+          const barriers = pendingInputBarriersRef.current;
+          const index = barriers.findIndex((barrier) => barrier.connection === inputSocket.connection);
+          if (index === -1) return false;
+          const [barrier] = barriers.splice(index, 1);
+          clearTimeout(barrier!.timeout);
+          if (bytes[1] === 1) barrier!.resolve();
+          else barrier!.reject(new Error("Simulator input failed. Reload the preview and retry."));
+          return false;
+        }
         if (bytes[0] !== WS_MSG_CONFIG) return false;
         try {
           const cfg = JSON.parse(new TextDecoder().decode(bytes.subarray(1))) as StreamConfig;
@@ -1020,7 +1046,7 @@ function AppWithConfig({
         return false;
       },
       onDisconnect() {
-        cancelPendingPaste();
+        cancelPendingClipboardInput();
         setInputSocketOpen(false);
         setPhysicalPose(undefined);
         sentHingePoseRef.current = undefined;
@@ -1038,13 +1064,13 @@ function AppWithConfig({
     inputSocket.start();
 
     return () => {
-      cancelPendingPaste();
+      cancelPendingClipboardInput();
       if (inputSocketRef.current === inputSocket) inputSocketRef.current = null;
       hingeQueueRef.current?.clear();
       inputSocket.dispose();
       dismissInputSocketError();
     };
-  }, [config.wsUrl, config.inputAdmission, cancelPendingPaste]);
+  }, [config.wsUrl, config.inputAdmission, cancelPendingClipboardInput]);
 
   const sendWs = useCallback((tag: number, payload: object) => {
     inputSocketRef.current?.send(tag, payload);
@@ -1303,6 +1329,41 @@ function AppWithConfig({
 
   const pasteChainRef = useRef<Promise<void>>(Promise.resolve());
 
+  // Wait for this connection's earlier input before issuing Copy.
+  const waitForInputBarrier = useCallback(
+    (connection: object | null | undefined): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        const inputSocket = inputSocketRef.current;
+        if (!connection || connection !== inputSocket?.connection) {
+          reject(new Error("Simulator input disconnected during copy"));
+          return;
+        }
+        const barrier: PendingInputBarrier = {
+          connection,
+          resolve,
+          reject,
+          timeout: setTimeout(() => {
+            pendingInputBarriersRef.current = pendingInputBarriersRef.current.filter((b) => b !== barrier);
+            reject(new Error("Simulator input did not finish in time"));
+          }, INPUT_BARRIER_TIMEOUT_MS),
+        };
+        pendingInputBarriersRef.current.push(barrier);
+        if (!inputSocket.trySendEncoded(Uint8Array.of(0x11))) {
+          clearTimeout(barrier.timeout);
+          pendingInputBarriersRef.current = pendingInputBarriersRef.current.filter((b) => b !== barrier);
+          reject(new Error("Simulator input disconnected during copy"));
+        }
+      }),
+    [],
+  );
+
+  const waitForPriorInput = useCallback(async () => {
+    // Capture before draining keys so a reconnect cannot silently lose the selection.
+    const connection = inputSocketRef.current?.connection;
+    await keySender.idle();
+    await waitForInputBarrier(connection);
+  }, [keySender, waitForInputBarrier]);
+
   const sendPasteRequest = useCallback(
     (text?: string): Promise<{ cleanupWarning?: string }> => {
       const device = config.device;
@@ -1345,7 +1406,7 @@ function AppWithConfig({
 
   const sendTextToSim = useCallback((text: string) => sendPasteRequest(text), [sendPasteRequest]);
 
-  const clipboard = useClipboardToast(sendTextToSim);
+  const clipboard = useClipboardToast(config.device, waitForPriorInput, sendTextToSim);
 
   const simContainerRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -2014,6 +2075,11 @@ function AppWithConfig({
               />
               <ActionMenu
                 items={[
+                  {
+                    label: "Copy from Simulator",
+                    description: "Simulator clipboard to this device",
+                    onSelect: () => void clipboard.copyFromSim(),
+                  },
                   {
                     label: "Paste from Device",
                     description: "This device's clipboard to the simulator",

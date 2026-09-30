@@ -36,7 +36,7 @@ import {
   frameAncestorsPolicy,
   withBearerToken,
 } from './session-auth';
-import { SESSION_TOKEN } from './session-token';
+import { FRAME_ANCESTORS, SESSION_TOKEN } from './session-token';
 import { SERVER_HIDE_SIDEBAR } from './sidebar';
 import { listNewDeviceOptions } from './sim-options';
 import { SERVER_TRANSPORT } from './transport';
@@ -59,7 +59,7 @@ const UNGATED_ROUTES = new Set([READY_ROUTE, ANDROID_RECORDING_STOP_ROUTE]);
 const SIM_CAPTURE_PREFIX = `${SIM_PREFIX}/network-capture`;
 const SIM_HELPER_PREFIX = `${SIM_PREFIX}/helper/`;
 const FRAME_POLICY_HEADERS: Record<string, string> = SESSION_TOKEN
-  ? { 'Content-Security-Policy': frameAncestorsPolicy([]) }
+  ? { 'Content-Security-Policy': frameAncestorsPolicy(FRAME_ANCESTORS) }
   : {};
 
 // The exported dashboard shell (dist/client/index.html, a sibling of the

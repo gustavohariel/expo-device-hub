@@ -21,7 +21,7 @@ describe('iOS screenshot capture', () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]!.input).toBe(
-      'http://localhost:3400/vendor/serve-sim/api/screenshot?device=DEVICE%20A%2FB',
+      'http://localhost:3400/vendor/serve-sim/api/screenshot?device=DEVICE+A%2FB',
     );
     expect(requests[0]!.init).toEqual({ method: 'POST', cache: 'no-store' });
     expect(blob?.type).toBe('image/png');

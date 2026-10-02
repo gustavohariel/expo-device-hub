@@ -17,6 +17,7 @@ import {
   startMitmProxy,
 } from "../mitm-engine";
 import { CaptureStore } from "../store";
+import { CAPTURE_UPSTREAM_ENV } from "../upstream";
 import { useTempStateDir } from "../../__tests__/helpers";
 
 const MARKER = "serve-sim-capture-Qz7pLm";
@@ -165,6 +166,12 @@ describe("describeFailure", () => {
     expect(out).toContain("Nothing was listening");
     // The raw text is kept, so the detail is not lost.
     expect(out).toContain("Errno 61");
+  });
+
+  test("names an upstream proxy that refused the tunnel, rather than an absent listener", () => {
+    const out = describeFailure("Upstream proxy 127.0.0.1:8899 refused HTTP CONNECT request: 407 Proxy Authentication Required");
+    expect(out).toStartWith("The upstream proxy refused the connection: 407 Proxy Authentication Required.");
+    expect(out).not.toContain("Nothing was listening");
   });
 
   test("explains an unresolvable host", () => {
@@ -363,6 +370,21 @@ setInterval(() => {}, 1000);
       else process.env[key] = value;
     }
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refuses to start capture when SERVE_SIM_CAPTURE_UPSTREAM is not a usable proxy", async () => {
+  const previous = { mitmdump: process.env.SERVE_SIM_MITMDUMP, upstream: process.env[CAPTURE_UPSTREAM_ENV] };
+  // Runnable, so the start gets past locating mitmdump; the bad value must stop it before a spawn.
+  process.env.SERVE_SIM_MITMDUMP = "/bin/sh";
+  process.env[CAPTURE_UPSTREAM_ENV] = "proxy:8899";
+  try {
+    await expect(startMitmProxy(new CaptureStore())).rejects.toThrow(CAPTURE_UPSTREAM_ENV);
+  } finally {
+    for (const [key, value] of [["SERVE_SIM_MITMDUMP", previous.mitmdump], [CAPTURE_UPSTREAM_ENV, previous.upstream]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

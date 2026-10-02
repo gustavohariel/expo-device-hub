@@ -10,6 +10,7 @@ import { locateMitmdump } from "../mitm-engine";
 const ADDON = resolve(import.meta.dir, "../mitm-addon/servesim_capture.py");
 const PROBE = resolve(import.meta.dir, "fixtures/servesim-capture-probe.py");
 const BROTLI_PROBE = resolve(import.meta.dir, "fixtures/servesim-capture-brotli-probe.py");
+const ROUTE_PROBE = resolve(import.meta.dir, "fixtures/servesim-capture-route-probe.py");
 
 function python(): string | null {
   for (const candidate of ["python3", "/usr/bin/python3"]) {
@@ -194,6 +195,93 @@ describeOrSkip("servesim_capture addon", () => {
   test("reports a request that failed before any response", () => {
     expect(probe.errorWithoutResponseFrames).toBe(1);
     expect(probe.errorWithoutResponseMessage).toBe("connection reset");
+  });
+});
+
+describeOrSkip("servesim_capture upstream routing", () => {
+  const run = PYTHON ? spawnSync(PYTHON, [ROUTE_PROBE, ADDON], { stdio: "pipe", encoding: "utf8" }) : null;
+  if (run && run.status !== 0) throw new Error(`route probe failed (${run.status}):\n${run.stderr || run.stdout}`);
+  const probe: Record<string, unknown> = run ? JSON.parse(run.stdout.trim().split("\n").at(-1)!) : {};
+
+  test("forwards a request through the upstream serve-sim names for its origin", () => {
+    expect(probe.proxiedVia).toEqual(["http", ["127.0.0.1", 8899]]);
+    expect(probe.askedPath).toBe("/route");
+    // No explicit default port: a PAC file can answer https://host:443/ differently from https://host/.
+    expect(probe.askedUrl).toBe("https://api.example.com/");
+    expect(probe.askedToken).toBe("probe-token");
+  });
+
+  test("leaves a request direct when serve-sim names no upstream", () => {
+    expect(probe.directVia).toBeNull();
+  });
+
+  test("asks once per origin while the answer is fresh", () => {
+    expect(probe.cachedLookups).toBe(0);
+  });
+
+  test("leaves a CONNECT alone; the requests inside the tunnel are routed", () => {
+    expect(probe.connectVia).toBeNull();
+    expect(probe.connectLookups).toBe(0);
+  });
+
+  test("brackets an IPv6 host and keeps a port that is not the default", () => {
+    expect(probe.ipv6Url).toBe("http://[::1]:8080/");
+    expect(probe.otherPortUrl).toBe("https://api.example.com:8443/");
+  });
+
+  test("keeps a default port the app wrote out, which a PAC file can answer differently", () => {
+    expect(probe.writtenPortUrls).toEqual([
+      "http://written.example.com:80/",
+      "https://written.example.com:443/",
+      "http://written.example.com/",
+      "http://spoofed.example.com/",
+      "http://[::1]:80/",
+    ]);
+  });
+
+  test("limits how many new origins it looks up at once", () => {
+    expect(probe.spreadMostAtOnce).toBe(4);
+    expect(probe.spreadAllProxied).toBe(true);
+  });
+
+  test("shares one lookup among simultaneous requests to a new origin", () => {
+    expect(probe.burstLookups).toBe(1);
+    expect(probe.burstAllProxied).toBe(true);
+  });
+
+  test("holds requests no longer than one deadline when serve-sim stalls, without threads", () => {
+    expect(probe.stallSeconds as number).toBeLessThan(1.5);
+    expect(probe.stallConnections).toBe(1);
+    expect(probe.stallAllDirect).toBe(true);
+    expect(probe.stallThreadsAdded).toBe(0);
+  });
+
+  test("never sets a route on a server connection that other streams share", () => {
+    expect(probe.sharedUntouched).toBe(true);
+    expect(probe.sharedRoutes).toEqual([false, true, false, true, false, true, false, true, false, true]);
+    expect(probe.sharedKeptForDirect).toBe(true);
+  });
+
+  test("gives a request a new server connection when the open one is on another route", () => {
+    expect(probe.openReplaced).toBe(true);
+    expect(probe.openReplacedAddress).toEqual(["www.example.com", 443]);
+    expect(probe.openReplacedVia).toEqual(["http", ["127.0.0.1", 8899]]);
+    expect(probe.originalUntouched).toBe(true);
+  });
+
+  test("skips a request without a host", () => {
+    expect(probe.hostlessVia).toBeNull();
+    expect(probe.hostlessLookups).toBe(0);
+  });
+
+  test("goes direct and says so once when serve-sim does not answer", () => {
+    expect(probe.controlGoneVia).toBeNull();
+    expect(run?.stderr).toContain("[servesim-capture] could not ask serve-sim for the upstream proxy");
+  });
+
+  test("keeps a failed lookup for seconds, not as long as an answer", () => {
+    expect(probe.controlGoneKeptSeconds as number).toBeLessThanOrEqual(5);
+    expect(probe.answerKeptSeconds as number).toBeGreaterThan(5);
   });
 });
 

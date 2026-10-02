@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import { toHarEntry } from "../har";
-import { CONTROL_TOKEN_HEADER, MAX_CONTROL_BODY_BYTES_ENV, startMitmControl } from "../mitm-control";
+import type { ServerResponse } from "node:http";
+
+import { CONTROL_TOKEN_HEADER, MAX_CONTROL_BODY_BYTES_ENV, reply, startMitmControl } from "../mitm-control";
 import { CaptureStore } from "../store";
 
 async function withControl(
@@ -172,6 +174,64 @@ describe("mitm control server", () => {
       expect(await (await post("/response", { id: "flow-1", status: 200 })).json()).toEqual({ ok: true, cleared: true });
       expect(store.list()).toHaveLength(0);
     });
+  });
+
+  test("tells the addon where to forward a URL, behind the token", async () => {
+    const store = new CaptureStore(() => 10);
+    const asked: string[] = [];
+    const control = await startMitmControl({
+      store,
+      token: "secret",
+      fields: [],
+      resolveUpstream: async (url) => {
+        asked.push(url);
+        return url.startsWith("https://api.example.com") ? { host: "127.0.0.1", port: 8899 } : null;
+      },
+    });
+    const route = (url: string, token = "secret") =>
+      fetch(`http://127.0.0.1:${control.port}/route?url=${encodeURIComponent(url)}`, {
+        headers: { [CONTROL_TOKEN_HEADER]: token },
+      });
+    try {
+      expect((await route("https://api.example.com:443/", "wrong")).status).toBe(403);
+      expect(await (await route("https://api.example.com:443/")).json()).toEqual({ upstream: { host: "127.0.0.1", port: 8899 } });
+      expect(await (await route("http://printer.local:80/")).json()).toEqual({ upstream: null });
+      expect(asked).toEqual(["https://api.example.com:443/", "http://printer.local:80/"]);
+      expect(store.list()).toHaveLength(0);
+    } finally {
+      await new Promise<void>((resolve) => control.server.close(() => resolve()));
+    }
+  });
+
+  test("states each JSON reply's length, which the addon's route lookup requires", () => {
+    // Bun adds Content-Length on its own; Node, which runs the middleware build, would chunk without it.
+    let head: { status: number; headers: Record<string, string | number> } | undefined;
+    let sent = "";
+    const res = {
+      writeHead(status: number, headers: Record<string, string | number>) {
+        head = { status, headers };
+        return this;
+      },
+      end(text: string) {
+        sent = text;
+      },
+    } as unknown as ServerResponse;
+    reply(res, 200, { upstream: { host: "prøxy.example", port: 8899 } });
+    expect(head?.headers["content-length"]).toBe(Buffer.byteLength(sent));
+    expect(Buffer.byteLength(sent)).toBeGreaterThan(sent.length);
+  });
+
+  test("routes direct without a resolver", async () => {
+    const store = new CaptureStore(() => 10);
+    const control = await startMitmControl({ store, token: "secret", fields: [] });
+    try {
+      const response = await fetch(`http://127.0.0.1:${control.port}/route?url=https%3A%2F%2Fa.test%3A443%2F`, {
+        headers: { [CONTROL_TOKEN_HEADER]: "secret" },
+      });
+      expect(await response.json()).toEqual({ upstream: null });
+    } finally {
+      await new Promise<void>((resolve) => control.server.close(() => resolve()));
+    }
   });
 
   test("drops a post that stalls before its body finishes", async () => {

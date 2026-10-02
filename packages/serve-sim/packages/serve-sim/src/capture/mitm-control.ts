@@ -4,6 +4,7 @@ import { applyCaptureFields, captureFieldSet, type CaptureField } from "./fields
 import { redactHeaders } from "./redact";
 import { safeEqualString } from "../session-auth";
 import { clampBody, type CaptureStore } from "./store";
+import type { UpstreamResolver } from "./upstream";
 
 const PENDING_LIMIT = 1000;
 /** The header the addon sends its control token in. */
@@ -125,6 +126,8 @@ function bodyText(part: RecordPart | undefined) {
 }
 
 export function describeFailure(raw: string): string {
+  const upstream = /refused HTTP CONNECT request: (\d{3}[^)]*)/.exec(raw);
+  if (upstream) return `The upstream proxy refused the connection: ${upstream[1]!.trim()}. (${raw})`;
   if (/Errno 61|Connect call failed|refused/i.test(raw)) {
     return `Nothing was listening at the address the app connected to. (${raw})`;
   }
@@ -177,19 +180,23 @@ function finishRecord(
   }, /* settled */ true);
 }
 
-function reply(res: ServerResponse, status: number, body?: unknown): void {
+export function reply(res: ServerResponse, status: number, body?: unknown): void {
   if (body === undefined) {
     res.writeHead(status).end();
     return;
   }
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
+  const text = JSON.stringify(body);
+  // The addon's route lookup reads exactly this many bytes.
+  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(text) });
+  res.end(text);
 }
 
 export async function startMitmControl(options: {
   store: CaptureStore;
   token: string;
   fields: readonly CaptureField[];
+  /** Where the addon forwards a request; direct when absent. */
+  resolveUpstream?: UpstreamResolver;
   onOversizedBody?: (info: OversizedControlBodyInfo) => void;
   /** How long a post may take to arrive; replaceable in tests. */
   bodyTimeoutMs?: number;
@@ -235,6 +242,15 @@ export async function startMitmControl(options: {
     if (route.pathname === "/ready") {
       announceReady();
       return reply(res, 200, { ok: true });
+    }
+    if (route.pathname === "/route") {
+      const url = route.searchParams.get("url") ?? "";
+      const resolve = options.resolveUpstream ?? (async () => null);
+      void resolve(url).then(
+        (upstream) => reply(res, 200, { upstream }),
+        () => reply(res, 200, { upstream: null }),
+      );
+      return;
     }
 
     void readJsonBody(req, options.bodyTimeoutMs).then((payload) => {

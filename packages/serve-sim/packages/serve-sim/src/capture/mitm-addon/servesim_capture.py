@@ -1,5 +1,6 @@
 # Reports mitmproxy flows to the capture session control port.
 
+import asyncio
 import base64 as b64
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 
@@ -50,6 +52,21 @@ MAX_HEADERS = 100
 MAX_ERROR_CHARS = 1024
 # Bound object overhead as well as serialized bytes.
 QUEUE_ITEM_LIMIT = 10_000
+# serve-sim gives a PAC file 5 s; the lookup waits a little longer than that.
+ROUTE_TIMEOUT_SECONDS = 8
+ROUTE_TTL_SECONDS = 60
+# A failed lookup goes direct, but only briefly.
+ROUTE_FAILURE_TTL_SECONDS = 5
+ROUTE_CACHE_LIMIT = 1000
+ROUTE_MAX_BYTES = 4096
+# Bounds control connections and native lookups when many new origins arrive at once.
+ROUTE_MAX_LOOKUPS = 32
+# origin -> (expires at, upstream ServerSpec or None for direct)
+_routes = {}
+# origin -> the lookup in flight; every request to that origin waits on the same one.
+_pending = {}
+_route_warned = False
+_slots = None  # (event loop, Semaphore): a semaphore belongs to one loop
 
 # Single worker preserves /request-before-/response order.
 _outbox: "queue.Queue[tuple[str, bytes, int] | None]" = queue.Queue()
@@ -296,6 +313,97 @@ def _part(message, want_body):
                 part["body"] = None
                 part["base64"] = b64.b64encode(head).decode("ascii")
     return part
+
+
+def _origin_of(request):
+    # The URL a PAC file sees, without the path. A PAC can answer "http://host/" and "http://host:80/"
+    # differently; mitmproxy normalizes the port, but the Host header keeps one the app wrote out.
+    host = f"[{request.host}]" if ":" in request.host else request.host
+    default = {"http": 80, "https": 443}.get(request.scheme)
+    written = (getattr(request, "host_header", None) or "").lower() == f"{host}:{request.port}".lower()
+    port = "" if request.port == default and not written else f":{request.port}"
+    return f"{request.scheme}://{host}{port}/"
+
+
+def _lookup_slots():
+    global _slots
+    loop = asyncio.get_running_loop()
+    if _slots is None or _slots[0] is not loop:
+        _slots = (loop, asyncio.Semaphore(ROUTE_MAX_LOOKUPS))
+    return _slots[1]
+
+
+async def _ask_route(origin):
+    """The upstream ServerSpec serve-sim names for this origin, or None for direct. Raises when
+    serve-sim does not answer. Plain asyncio, so shutdown never waits for a blocked thread."""
+    async with _lookup_slots():
+        control = urllib.parse.urlsplit(CONTROL)
+        reader, writer = await asyncio.open_connection(control.hostname, control.port)
+        try:
+            query = urllib.parse.urlencode({"url": origin})
+            writer.write(
+                f"GET /route?{query} HTTP/1.1\r\nHost: {control.netloc}\r\n"
+                f"x-serve-sim-capture-token: {TOKEN}\r\nConnection: close\r\n\r\n".encode("latin-1")
+            )
+            lines = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1").split("\r\n")
+            headers = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(":")
+                headers[name.strip().lower()] = value.strip()
+            length = headers.get("content-length", "")
+            if lines[0].split(" ")[1:2] != ["200"] or not length.isdigit() or int(length) > ROUTE_MAX_BYTES:
+                raise ValueError(f"unexpected reply from serve-sim: {lines[0]}")
+            upstream = json.loads(await reader.readexactly(int(length))).get("upstream")
+        finally:
+            writer.close()
+    return ("http", (str(upstream["host"]), int(upstream["port"]))) if upstream else None
+
+
+async def _lookup(origin):
+    global _route_warned
+    try:
+        # The deadline includes the wait for a free lookup slot.
+        via = await asyncio.wait_for(_ask_route(origin), ROUTE_TIMEOUT_SECONDS)
+        ttl = ROUTE_TTL_SECONDS
+    except Exception:
+        if not _route_warned:
+            _route_warned = True
+            print(
+                "[servesim-capture] could not ask serve-sim for the upstream proxy; captured requests "
+                "go direct for now.",
+                file=sys.stderr,
+            )
+        via, ttl = None, ROUTE_FAILURE_TTL_SECONDS
+    finally:
+        _pending.pop(origin, None)
+    if len(_routes) >= ROUTE_CACHE_LIMIT:
+        _routes.clear()
+    _routes[origin] = (time.monotonic() + ttl, via)
+    return via
+
+
+async def requestheaders(flow):
+    # A CONNECT only opens the tunnel; the requests inside it are routed one by one.
+    if not CONTROL or flow.request.method == "CONNECT" or not flow.request.host:
+        return
+    origin = _origin_of(flow.request)
+    cached = _routes.get(origin)
+    if cached is not None and cached[0] > time.monotonic():
+        via = cached[1]
+    else:
+        lookup = _pending.get(origin)
+        if lookup is None:
+            lookup = _pending[origin] = asyncio.ensure_future(_lookup(origin))
+        # A request that goes away must not cancel the lookup other requests wait on.
+        via = await asyncio.shield(lookup)
+    if flow.server_conn.via == via:
+        return
+    # A request on another route gets its own connection: the current one may be shared, like the
+    # tunnel's server every HTTP/2 stream starts from.
+    from mitmproxy.connection import Server
+
+    flow.server_conn = Server(address=flow.server_conn.address)
+    flow.server_conn.via = via
 
 
 def request(flow):

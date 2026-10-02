@@ -31,6 +31,7 @@ import {
   startMitmControl,
   type OversizedControlBodyInfo,
 } from "./mitm-control";
+import { createUpstreamResolver, guardUpstream, type UpstreamResolver } from "./upstream";
 
 export {
   DEFAULT_MAX_CONTROL_BODY_BYTES,
@@ -299,6 +300,8 @@ export function parseMitmPids(psOutput: string, marker: string, selfPid: number)
 
 export interface MitmProxyDeps {
   fields?: readonly CaptureField[];
+  /** Where each captured request is forwarded; the system proxy settings by default. */
+  resolveUpstream?: UpstreamResolver;
   onUnexpectedExit?: (reason: string) => void;
   onOversizedControlBody?: (info: OversizedControlBodyInfo) => void;
 }
@@ -361,6 +364,7 @@ async function startMitmProxyAttempt(
   mitmdump: string,
   addon: string,
   fields: readonly CaptureField[],
+  resolveUpstream: UpstreamResolver,
 ): Promise<CaptureProxy> {
   const proxyPort = await freePort();
   const confdir = mkdtempSync(join(tmpdir(), CONFDIR_PREFIX));
@@ -373,6 +377,7 @@ async function startMitmProxyAttempt(
       store,
       token,
       fields,
+      resolveUpstream: guardUpstream(resolveUpstream, { ownPort: proxyPort }),
       onOversizedBody: deps.onOversizedControlBody,
     });
   } catch (error) {
@@ -394,6 +399,9 @@ async function startMitmProxyAttempt(
         String(proxyPort),
         "--set",
         "anticomp=true",
+        // The addon picks each request's upstream before its server connection opens.
+        "--set",
+        "connection_strategy=lazy",
         "--set",
         `confdir=${confdir}`,
         "-s",
@@ -540,11 +548,12 @@ export async function startMitmProxy(
   if (!mitmdump) throw new Error(mitmdumpMissingMessage(process.env.SERVE_SIM_MITMDUMP));
   const addon = locateAddon();
   const fields = deps.fields ?? DEFAULT_CAPTURE_FIELDS;
+  const resolveUpstream = deps.resolveUpstream ?? createUpstreamResolver();
 
   let lastError: unknown;
   for (let attempt = 0; attempt < STARTUP_ATTEMPTS; attempt++) {
     try {
-      return await startMitmProxyAttempt(store, deps, mitmdump, addon, fields);
+      return await startMitmProxyAttempt(store, deps, mitmdump, addon, fields, resolveUpstream);
     } catch (error) {
       lastError = error;
       if (!addressAlreadyInUse(error) && !(error instanceof CaRaceLostError)) throw error;

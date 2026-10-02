@@ -371,4 +371,14 @@ private func axQuery<T: Sendable>(
             }
         }
     },
+    // resolveProxies(url, settingsJson, timeoutSeconds): Promise<string> — JSON list of the proxies
+    // macOS would use for `url`. An empty `settingsJson` reads the live system settings.
+    "resolveProxies": try NodeFunction { (url: String, settingsJson: String, timeout: Double) async throws -> String in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do { cont.resume(returning: try SystemProxy.resolveJSON(url, settingsJSON: settingsJson, timeout: timeout)) }
+                catch { cont.resume(throwing: error) }
+            }
+        }
+    },
 ])

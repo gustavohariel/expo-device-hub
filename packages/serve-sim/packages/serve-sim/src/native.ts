@@ -81,6 +81,7 @@ interface NativeAddon {
   axFrontmost(udid: string): Promise<string>;
   axTypeKeyboardCharacter(udid: string, character: string): Promise<boolean>;
   setHardwareKeyboard(udid: string, enabled: boolean): Promise<boolean>;
+  resolveProxies(url: string, settingsJson: string, timeoutSeconds: number): Promise<string>;
 }
 
 // (codec, data, width, height, flags) — codec 0=MJPEG 1=AVCC; flags bit0=desc bit1=keyframe.
@@ -409,4 +410,23 @@ export function axTypeKeyboardCharacterAsync(udid: string, character: string): P
  */
 export function setHardwareKeyboard(udid: string, enabled: boolean): Promise<boolean> {
   return load().setHardwareKeyboard(udid, enabled);
+}
+
+export type SystemProxyEntry = {
+  type: "direct" | "http" | "https" | "socks" | "unknown";
+  host?: string;
+  port?: number;
+};
+
+/**
+ * The proxies macOS would use for `url`, in order, after the bypass list and proxy auto-config. A
+ * PAC file or script that does not finish within `pacTimeoutMs` yields no entries. `settings`
+ * replaces the live system settings, in the shape `scutil --proxy` prints; for tests.
+ */
+export async function resolveSystemProxies(
+  url: string,
+  settings?: Record<string, unknown>,
+  pacTimeoutMs = 5_000,
+): Promise<SystemProxyEntry[]> {
+  return JSON.parse(await load().resolveProxies(url, settings ? JSON.stringify(settings) : "", pacTimeoutMs / 1000));
 }

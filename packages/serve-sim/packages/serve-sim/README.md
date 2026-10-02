@@ -305,6 +305,8 @@ While capturing, the tools panel lists requests. Session files live under `$TMPD
 
 Requires [mitmproxy](https://mitmproxy.org/) on the host. Relaunch apps after enabling so they pick up the proxy. Details on redaction and risks: [docs/network-capture-security.md](docs/network-capture-security.md).
 
+Captured requests leave through the proxy the host's system settings choose for their URL (manual proxy, bypass list, PAC file, or auto-discovery), so capture works behind an HTTP proxy or a local egress tunnel. Proxies that require authentication are not supported. Set `SERVE_SIM_CAPTURE_UPSTREAM=http://host:port` to force one proxy, or `none` to send captured traffic direct.
+
 ## Connectors
 
 `serve-sim` can be used with dev servers, browser, and AI editors for more seamless integration.

@@ -27,6 +27,36 @@ uses it, so the simulator trusts one serve-sim root however often capture restar
 the device reboots; teardown does not remove it. To make a new CA, delete `capture-ca/`; the next
 capture start creates one and trusts it, and erasing the simulator removes the old root.
 
+### Upstream proxy
+
+The capture proxy forwards each request the way the app would send it without capture. For each
+origin (scheme, host, and port), serve-sim asks CFNetwork which proxy the system settings choose: the
+manual HTTP and HTTPS proxies with their bypass list, a PAC file, or a PAC file that auto-discovery
+finds. mitmproxy uses the first HTTP or HTTPS proxy in the answer, and goes direct at the first
+`DIRECT` entry. serve-sim logs each upstream proxy the first time it forwards through it.
+
+- SOCKS proxies and proxy hosts that hold credentials are skipped. serve-sim logs that once, without
+  the value.
+- A PAC file gets 5 seconds; one that cannot be fetched or does not finish sends the request direct.
+  It sees the origin URL, such as `https://api.example.com/`, so PAC rules that test the path do not
+  apply. The URL has a default port (`:80` or `:443`) only when the app's `Host` header names it.
+- Requests to one origin share one answer, which is reused for 60 seconds. At most 32 origins are
+  looked up at once. When serve-sim does not answer within 8 seconds, the request goes direct, and
+  the origin is asked again after 5 seconds.
+- With manual proxy settings, `localhost` and `127.0.0.1` stay direct.
+- On the capture proxy's own port, an IP address or `localhost` name goes direct, because it could be
+  the capture proxy itself. serve-sim does not resolve other host names for this check, and it cannot
+  detect a loop through another proxy.
+- mitmproxy opens a `CONNECT` tunnel through the upstream proxy for each server connection, plain
+  HTTP included (`CONNECT host:80`). A proxy that allows `CONNECT` only to port 443 refuses captured
+  plain HTTP. Capture sends no proxy credentials, so a proxy that requires authentication refuses
+  captured requests.
+- The capture proxy opens a server connection only after it picks the route, so it makes each host's
+  certificate from the name the app connected to.
+
+`SERVE_SIM_CAPTURE_UPSTREAM` replaces the system settings: `http://host:port` sends all captured
+traffic through that proxy, and `none` sends it direct. Capture does not start with any other value.
+
 ## What is recorded
 
 Capture includes exchanges from supported sessions in other third-party apps on the device, not just
